@@ -1,0 +1,7 @@
+#define ETH_INTERFACE   "@eth_ifa@"
+#define ETH_CONNECTION  "@eth_con@"
+
+#define MOB_INTERFACE   "@sim_ifa@"
+#define MOB_CONNECTION  "@sim_con@"
+
+#define MIN(a,b)        ((a<b) ? (a) : (b))
