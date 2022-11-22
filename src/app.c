@@ -1,31 +1,38 @@
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
+#include <stdlib.h>
 #include <time.h>
-#include <sys/types.h>
-#include <ifaddrs.h>
-#include <netdb.h>
-#include <netinet/ip.h>
+#include <fcntl.h>
 #include <errno.h>
+#include <netdb.h>
 #include <memory.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <sys/sysinfo.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <signal.h>
-#include <sys/ioctl.h>
-#include <net/if.h>
-#include <linux/if_link.h>
-#include <bits/sockaddr.h>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
 #include <asm/types.h>
+#include <bits/sockaddr.h>
+#include <net/if.h>
+#include <netinet/ip.h>
+#include <linux/if_link.h>
 #include <linux/rtnetlink.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/sysinfo.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
+
 #include "app.h"
 #include "nlrequest.h"
 #include "getifn.h"
 
-#define  SERVER_CONFIG  "/home/defigo/.config/Doorbell ink/Doorbell.conf"
-#define  SERVER_OPTION  "url="
+#define  SERVER_CONFIG          "/home/defigo/.config/Doorbell ink/Doorbell.conf"
+#define  SERVER_OPTION          "url="
+#define  MAX_ROUTES             64
+#define  CONNECT_TIMEOUT_S      5
+#define  CONNECT_TIMEOUT_uS     0
 
 int check_error = 0;
 time_t tmLast = 0;
@@ -33,9 +40,13 @@ int g_stop = 0;
 int g_run = 0;
 pthread_mutex_t mtx_signal;
 struct in_addr server = {0L};
+struct nlmsghdr *routes[MAX_ROUTES];
+int n_routes;
 int server_port = 0;
 int netlink_sck = 0;
 int active_cnt = 0;
+time_t time1 = 0;
+time_t time2 = 0;
 
 typedef struct connection_info_s {
     char interface[10];
@@ -50,6 +61,9 @@ connection_info_t emak[2] = {
     {MOB_INTERFACE, MOB_CONNECTION, -1, 0, 0, 0},
     {ETH_INTERFACE, ETH_CONNECTION, -1, 0, 0, 0}
 };
+
+#define MOB 0
+#define ETH 1
 
 void sigusr1_handler(int sig) {
     pthread_mutex_lock(&mtx_signal);
@@ -67,6 +81,133 @@ void printTime(char *msg) {
     time_t tm = time(NULL);
     printf("%s %ld sec\n", msg, tm - tmLast);
     tmLast = tm;
+}
+
+
+const char* rta_type_name(unsigned short val) {
+    static char ret[10] = {0};
+    switch(val) {
+        case RTA_UNSPEC: return "RTA_UNSPEC";
+        case RTA_DST: return "RTA_DST";
+        case RTA_SRC: return "RTA_SRC";
+        case RTA_IIF: return "RTA_IIF";
+        case RTA_OIF: return "RTA_OIF";
+        case RTA_GATEWAY: return "RTA_GATEWAY";
+        case RTA_PRIORITY: return "RTA_PRIORITY";
+        case RTA_PREFSRC: return "RTA_PREFSRC";
+        case RTA_METRICS: return "RTA_METRICS";
+        case RTA_MULTIPATH: return "RTA_MULTIPATH";
+        case RTA_PROTOINFO: return "RTA_PROTOINFO";
+        case RTA_FLOW: return "RTA_FLOW";
+        case RTA_CACHEINFO: return "RTA_CACHEINFO";
+        case RTA_SESSION: return "RTA_SESSION";
+        case RTA_MP_ALGO: return "RTA_MP_ALGO";
+        case RTA_TABLE: return "RTA_TABLE";
+        case RTA_MARK: return "RTA_MARK";
+        case RTA_MFC_STATS: return "RTA_MFC_STATS";
+        case RTA_VIA: return "RTA_VIA";
+        case RTA_NEWDST: return "RTA_NEWDST";
+        case RTA_PREF: return "RTA_PREF";
+        case RTA_ENCAP_TYPE: return "RTA_ENCAP_TYPE";
+        case RTA_ENCAP: return "RTA_ENCAP";
+        case RTA_EXPIRES: return "RTA_EXPIRES";
+        case RTA_PAD: return "RTA_PAD";
+        case RTA_UID: return "RTA_UID";
+        case RTA_TTL_PROPAGATE: return "RTA_TTL_PROPAGATE";
+        case RTA_IP_PROTO: return "RTA_IP_PROTO";
+        case RTA_SPORT: return "RTA_SPORT";
+        case RTA_DPORT: return "RTA_DPORT";
+        case RTA_NH_ID: return "RTA_NH_ID";
+        case __RTA_MAX: return "__RTA_MAX";
+    }
+    snprintf(ret, 9, "%d", val);
+    return ret;
+}
+
+const char* ifla_type_name(unsigned short val) {
+    static char ret[10] = {0};
+    switch(val) {
+        case IFLA_UNSPEC: return "IFLA_UNSPEC";
+        case IFLA_ADDRESS: return "IFLA_ADDRESS";
+        case IFLA_BROADCAST: return "IFLA_BROADCAST";
+        case IFLA_IFNAME: return "IFLA_IFNAME";
+        case IFLA_MTU: return "IFLA_MTU";
+        case IFLA_LINK: return "IFLA_LINK";
+        case IFLA_QDISC: return "IFLA_QDISC";
+        case IFLA_STATS: return "IFLA_STATS";
+        case IFLA_COST: return "IFLA_COST";
+        case IFLA_PRIORITY: return "IFLA_PRIORITY";
+        case IFLA_MASTER: return "IFLA_MASTER";
+        case IFLA_WIRELESS: return "IFLA_WIRELESS";
+        case IFLA_PROTINFO: return "IFLA_PROTINFO";
+        case IFLA_TXQLEN: return "IFLA_TXQLEN";
+        case IFLA_MAP: return "IFLA_MAP";
+        case IFLA_WEIGHT: return "IFLA_WEIGHT";
+        case IFLA_OPERSTATE: return "IFLA_OPERSTATE";
+        case IFLA_LINKMODE: return "IFLA_LINKMODE";
+        case IFLA_LINKINFO: return "IFLA_LINKINFO";
+        case IFLA_NET_NS_PID: return "IFLA_NET_NS_PID";
+        case IFLA_IFALIAS: return "IFLA_IFALIAS";
+        case IFLA_NUM_VF: return "IFLA_NUM_VF";
+        case IFLA_VFINFO_LIST: return "IFLA_VFINFO_LIST";
+        case IFLA_STATS64: return "IFLA_STATS64";
+        case IFLA_VF_PORTS: return "IFLA_VF_PORTS";
+        case IFLA_PORT_SELF: return "IFLA_PORT_SELF";
+        case IFLA_AF_SPEC: return "IFLA_AF_SPEC";
+        case IFLA_GROUP: return "IFLA_GROUP";
+        case IFLA_NET_NS_FD: return "IFLA_NET_NS_FD";
+        case IFLA_EXT_MASK: return "IFLA_EXT_MASK";
+        case IFLA_PROMISCUITY: return "IFLA_PROMISCUITY";
+        case IFLA_NUM_TX_QUEUES: return "IFLA_NUM_TX_QUEUES";
+        case IFLA_NUM_RX_QUEUES: return "IFLA_NUM_RX_QUEUES";
+        case IFLA_CARRIER: return "IFLA_CARRIER";
+        case IFLA_PHYS_PORT_ID: return "IFLA_PHYS_PORT_ID";
+        case IFLA_CARRIER_CHANGES: return "IFLA_CARRIER_CHANGES";
+        case IFLA_PHYS_SWITCH_ID: return "IFLA_PHYS_SWITCH_ID";
+        case IFLA_LINK_NETNSID: return "IFLA_LINK_NETNSID";
+        case IFLA_PHYS_PORT_NAME: return "IFLA_PHYS_PORT_NAME";
+        case IFLA_PROTO_DOWN: return "IFLA_PROTO_DOWN";
+        case IFLA_GSO_MAX_SEGS: return "IFLA_GSO_MAX_SEGS";
+        case IFLA_GSO_MAX_SIZE: return "IFLA_GSO_MAX_SIZE";
+        case IFLA_PAD: return "IFLA_PAD";
+        case IFLA_XDP: return "IFLA_XDP";
+        case IFLA_EVENT: return "IFLA_EVENT";
+        case IFLA_NEW_NETNSID: return "IFLA_NEW_NETNSID";
+        case IFLA_IF_NETNSID: return "IFLA_IF_NETNSID";
+        case IFLA_CARRIER_UP_COUNT: return "IFLA_CARRIER_UP_COUNT";
+        case IFLA_CARRIER_DOWN_COUNT: return "IFLA_CARRIER_DOWN_COUNT";
+        case IFLA_NEW_IFINDEX: return "IFLA_NEW_IFINDEX";
+        case IFLA_MIN_MTU: return "IFLA_MIN_MTU";
+        case IFLA_MAX_MTU: return "IFLA_MAX_MTU";
+        case IFLA_PROP_LIST: return "IFLA_PROP_LIST";
+        case IFLA_ALT_IFNAME: return "IFLA_ALT_IFNAME";
+        case IFLA_PERM_ADDRESS: return "IFLA_PERM_ADDRESS";
+        case IFLA_PROTO_DOWN_REASON: return "IFLA_PROTO_DOWN_REASON";
+        case IFLA_PARENT_DEV_NAME: return "IFLA_PARENT_DEV_NAME";
+        case IFLA_PARENT_DEV_BUS_NAME: return "IFLA_PARENT_DEV_BUS_NAME";
+    }
+    snprintf(ret, 9, "%d", val);
+    return ret;
+}
+
+void print_data(struct rtattr *rtap) {
+    int len = rtap->rta_len;
+    // char buf[256];
+    char *data = (((char*)(rtap)) + sizeof(struct rtattr));
+    printf("--- %s [sz=%d] =", ifla_type_name(rtap->rta_type), rtap->rta_len);
+    for(int i = 0; i < len; i++) {
+        printf(" %02X", data[i]);
+        if(i > 24) {
+            printf("...");
+            break;
+        }
+    }
+    switch(rtap->rta_type) {
+        case IFLA_IFNAME:
+            printf(" == %s", data);
+            break;
+    }
+    printf("\n");
 }
 
 void read_config() {
@@ -119,16 +260,10 @@ void read_config() {
     fclose(fp);
 }
 
-
-void check_routes() {
-
-}
-
-void read_reply_ifn(int fd) {
+int read_reply_ifn(int fd) {
     char buf[8192];
-    char ip[25];
     char *p;
-    int nll = 0, rtl, rtn;
+    int nll = 0, rtl, rtn, i;
     struct nlmsghdr *nlp;
 
     bzero(buf, sizeof(buf));
@@ -136,97 +271,43 @@ void read_reply_ifn(int fd) {
     p = buf;
     nll = 0;
 
-    // read from the socket until the NLMSG_DONE is
-    // returned in the type of the RTNETLINK message
-    // or if it was a monitoring socket
     while(1) {
         rtn = recv(fd, p, sizeof(buf) - nll, 0);
-
         nlp = (struct nlmsghdr *) p;
-
-        if(nlp->nlmsg_type == NLMSG_DONE)
-        break;
-
-        // increment the buffer pointer to place
-        // next message
+        if(nlp->nlmsg_type == NLMSG_DONE) break;
         p += rtn;
-
-        // increment the total size by the size of
-        // the last received message
         nll += rtn;
-
-        // if((la.nl_groups & RTMGRP_IPV4_ROUTE)
-        //                 == RTMGRP_IPV4_ROUTE)
-        // break;
     }
 
-
-    struct ifinfomsg *rtp;
-    struct rtattr *rtap;
-    // outer loop: loops thru all the NETLINK
-    // headers that also include the route entry
-    // header
+    struct ifinfomsg *ifp;
+    struct rtattr *ifap;
     nlp = (struct nlmsghdr *) buf;
     for(;NLMSG_OK(nlp, nll);nlp=NLMSG_NEXT(nlp, nll)) {
-        // get route entry header
-        rtp = (struct ifinfomsg *) NLMSG_DATA(nlp);
-
-        // inner loop: loop thru all the attributes of
-        // one route entry
-        rtap = (struct rtattr *) RTM_RTA(rtp);
+        ifp = (struct ifinfomsg *) NLMSG_DATA(nlp);
+        ifap = (struct rtattr *) IFLA_RTA(ifp);
         rtl = RTM_PAYLOAD(nlp);
-        int gateway = 0;
-        unsigned char oif_dmp[8];
-        unsigned char priority_dmp[8];
-        int oif = 0;
-        int metric = 0;
-        int len;
-        char *data;
-        for(;RTA_OK(rtap, rtl);rtap=RTA_NEXT(rtap,rtl)) {
-            // print_data(rtap, rtp);
-            len = rtap->rta_len;
-            switch(rtap->rta_type) {
-                case RTA_GATEWAY:
-                    gateway = 1;
-                    inet_ntop(AF_INET, RTA_DATA(rtap), ip, 25);
-                    break;
-
-                case RTA_OIF:
-                    oif = *((int *) RTA_DATA(rtap));
-                    data = (((char*)(rtap)) + sizeof(struct rtattr));
-                    bcopy(data, oif_dmp, MIN(8, len));
-                    break;
-
-                case RTA_PRIORITY:
-                    metric = *((int *) RTA_DATA(rtap));
-                    data = (((char*)(rtap)) + sizeof(struct rtattr));
-                    bcopy(data, priority_dmp, MIN(8, len));
-                    break;
-
-                default:
+        for(;RTA_OK(ifap, rtl);ifap=RTA_NEXT(ifap,rtl)) {
+            // print_data(ifap);
+            switch(ifap->rta_type) {
+                case IFLA_IFNAME:
+                    p = RTA_DATA(ifap);
+                    for(i = 0; i < 2; i++) {
+                        if(strcmp(p, emak[i].interface) == 0) {
+                            emak[i].ifx = ifp->ifi_index;
+                            // printf(">>> %d = %s\n", emak[i].ifx, p);
+                        }
+                    }
                     break;
             }
         }
-
-        if(gateway) {
-            printf("oif=%d metric=%d, gw=%s\n", oif, metric, ip);
-        }
     }
+    return 0;
 }
 
-void read_interfaces_old(int fd) {
-    // connection_info_t *ci;
-    // int i;
-    // for (i = 0; i < 2; i++) {
-    //     ci = emak + i;
-    //     ci->ifx = getifn(netlink_sck, ci->interface);
-    //     printf("%-10s: %d\n", ci->interface, ci->ifx);
-    // }
-
+int read_interfaces(int fd) {
     struct {
         struct nlmsghdr  nl;
         struct ifinfomsg i;
-        char             buf[8192];
     } req;
     int r;
 
@@ -261,125 +342,109 @@ void read_interfaces_old(int fd) {
     r = sendmsg(fd, &msg, 0);
     if(r < 0) {
         fprintf(stderr, "Sendmsg error: %s\n", strerror(errno));
-        return;
+        return 1;
     }
-    read_reply_ifn(fd);
+    return read_reply_ifn(fd);
 }
 
     // SOCK_STREAM == TCP
     // SOCK_DGRAM == UDP
     // IP protocol == 0
-int check_interface(char *ifa_name, struct in_addr *server) {
+int check_interface(char *ifa_name) {
     int r;
     struct sockaddr_in addr;
+    fd_set fdset;
+    struct timeval tv;
     int sock = socket( AF_INET, SOCK_STREAM, 0 );
 
     if(sock < 0) {
-        fprintf(stderr, "Unable to create socket for %s\n", ifa_name);
+        fprintf(stderr, "Unable to create socket for %s : (%d) %s\n", ifa_name, errno, strerror(errno));
         return 1;
+    }
+
+    r = fcntl(sock, F_SETFL, O_NONBLOCK);
+    if(r < 0) {
+        fprintf(stderr, "Unable to fcntl socket for %s : (%d) %s\n", ifa_name, errno, strerror(errno));
+        close(sock);
+        return 2;
     }
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(server_port);
-    addr.sin_addr = *server;
+    addr.sin_addr = server;
     r = setsockopt( sock, SOL_SOCKET, SO_BINDTODEVICE, ifa_name, strlen(ifa_name) );
     if(r < 0) {
-        fprintf(stderr, "setsockopt error [%d] %s\n", errno, strerror(errno));
-        return 2;
+        fprintf(stderr, "Unable setsockopt for %s : (%d) %s\n", ifa_name, errno, strerror(errno));
+        close(sock);
+        return 3;
     }
-    r = connect(sock, (struct sockaddr *)&addr, sizeof(struct sockaddr_in) );
-    check_error = r < 0 ? errno : 0;
+
+    connect(sock, (struct sockaddr *)&addr, sizeof(struct sockaddr_in) );
+    FD_ZERO(&fdset);
+    FD_SET(sock, &fdset);
+    tv.tv_sec = CONNECT_TIMEOUT_S;
+    tv.tv_usec = CONNECT_TIMEOUT_uS;
+
+    if(select(sock + 1, NULL, &fdset, NULL, &tv) == 1) {
+        int so_error = 1;
+        socklen_t len = sizeof so_error;
+
+        r = getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len);
+        if(r < 0) {
+            check_error = errno;
+            r = 5;
+        } else {
+            if (so_error == 0) {
+                r = 0;
+            } else {
+                check_error = so_error;
+                r = 4;
+            }
+        }
+    } else {
+        check_error = errno;
+        r = 6;
+    }
     close(sock);
     return r;
 }
 
 void check_interfaces() {
+    connection_info_t *ci;
+    int i, r;
+    for (i = 0; i < 2; i++) {
+        ci = emak + i;
+        printf("%10s: ", ci->interface);
+        r = check_interface(ci->interface);
+        switch(r) {
+            case 1:
+            case 2:
+            case 3:
+                // internal error
+                ci->valid = 0;
+                break;
 
+            case 4:
+        }
+        if(ci->valid) {
+            printf("has access");
+        } else {
+            printf("no access");
+        }
+        printf("\n");
+    }
+    if(emak[ETH].valid && emak[MOB].metric < 700) {
+        // set MOB metric = 710
+        printf("Switch to Ethernet\n");
+    }
+    if(!emak[ETH].valid && emak[MOB].valid && emak[MOB].metric > 700) {
+        // set MOB metric = 10
+        printf("Switch to Wireless\n");
+    }
 }
 
-const char* rta_type_name(unsigned short val) {
-    switch(val) {
-        case RTA_UNSPEC: return "RTA_UNSPEC";
-        case RTA_DST: return "RTA_DST";
-        case RTA_SRC: return "RTA_SRC";
-        case RTA_IIF: return "RTA_IIF";
-        case RTA_OIF: return "RTA_OIF";
-        case RTA_GATEWAY: return "RTA_GATEWAY";
-        case RTA_PRIORITY: return "RTA_PRIORITY";
-        case RTA_PREFSRC: return "RTA_PREFSRC";
-        case RTA_METRICS: return "RTA_METRICS";
-        case RTA_MULTIPATH: return "RTA_MULTIPATH";
-        case RTA_PROTOINFO: return "RTA_PROTOINFO";
-        case RTA_FLOW: return "RTA_FLOW";
-        case RTA_CACHEINFO: return "RTA_CACHEINFO";
-        case RTA_SESSION: return "RTA_SESSION";
-        case RTA_MP_ALGO: return "RTA_MP_ALGO";
-        case RTA_TABLE: return "RTA_TABLE";
-        case RTA_MARK: return "RTA_MARK";
-        case RTA_MFC_STATS: return "RTA_MFC_STATS";
-        case RTA_VIA: return "RTA_VIA";
-        case RTA_NEWDST: return "RTA_NEWDST";
-        case RTA_PREF: return "RTA_PREF";
-        case RTA_ENCAP_TYPE: return "RTA_ENCAP_TYPE";
-        case RTA_ENCAP: return "RTA_ENCAP";
-        case RTA_EXPIRES: return "RTA_EXPIRES";
-        case RTA_PAD: return "RTA_PAD";
-        case RTA_UID: return "RTA_UID";
-        case RTA_TTL_PROPAGATE: return "RTA_TTL_PROPAGATE";
-        case RTA_IP_PROTO: return "RTA_IP_PROTO";
-        case RTA_SPORT: return "RTA_SPORT";
-        case RTA_DPORT: return "RTA_DPORT";
-        case RTA_NH_ID: return "RTA_NH_ID";
-        case __RTA_MAX: return "__RTA_MAX";
-    }
-    return "?";
-}
-
-const char* rt_table_name(unsigned long val) {
-    switch(val) {
-        case RT_TABLE_UNSPEC: return "RT_TABLE_UNSPEC";
-        case RT_TABLE_COMPAT: return "RT_TABLE_COMPAT";
-        case RT_TABLE_DEFAULT: return "RT_TABLE_DEFAULT";
-        case RT_TABLE_MAIN: return "RT_TABLE_MAIN";
-        case RT_TABLE_LOCAL: return "RT_TABLE_LOCAL";
-        case RT_TABLE_MAX: return "RT_TABLE_MAX";
-    }
-    return "?";
-}
-
-void print_data(struct rtattr *rtap, struct rtmsg *rtp) {
-    int len = rtap->rta_len;
-    char buf[256];
-    char *data = (((char*)(rtap)) + sizeof(struct rtattr));
-    printf("--- %s [sz=%d] =", rta_type_name(rtap->rta_type), rtap->rta_len);
-    for(int i = 0; i < len; i++) {
-        printf(" %02X", data[i]);
-    }
-    switch(rtap->rta_type) {
-        case RTA_GATEWAY:
-            inet_ntop(AF_INET, RTA_DATA(rtap), buf, 24);
-            printf(" == %s", buf);
-            break;
-
-        case RTA_DST:
-            inet_ntop(AF_INET, RTA_DATA(rtap), buf, 24);
-            printf(" == %s/%d", buf, rtp->rtm_dst_len);
-            break;
-
-        case RTA_OIF:
-        case RTA_METRICS:
-        case RTA_PRIORITY:
-            printf(" == %d", *((int *) RTA_DATA(rtap)));
-            break;
-
-        default:
-            break;
-    }
-    printf("\n");
-}
-
-void read_reply(int fd) {
+int read_reply_routes(int fd) {
     // string to hold content of the route
     // table (i.e. one entry)
     char buf[8192];
@@ -387,7 +452,16 @@ void read_reply(int fd) {
     char *p;
     int nll = 0, rtl, rtn, i;
     struct nlmsghdr *nlp;
+    struct nlmsghdr **nlpp;
     connection_info_t *ci;
+
+    nlpp = routes;
+    while(*nlpp) {
+        free(*nlpp);
+        (*nlpp++) = 0;
+    }
+    n_routes = 0;
+
 
     // initialize the socket read buffer
     bzero(buf, sizeof(buf));
@@ -424,6 +498,7 @@ void read_reply(int fd) {
 
     struct rtmsg *rtp;
     struct rtattr *rtap;
+    struct nlmsghdr* copy;
     // outer loop: loops thru all the NETLINK
     // headers that also include the route entry
     // header
@@ -461,6 +536,18 @@ void read_reply(int fd) {
                     oif = *((int *) RTA_DATA(rtap));
                     data = (((char*)(rtap)) + sizeof(struct rtattr));
                     bcopy(data, oif_dmp, MIN(8, len));
+                    if(n_routes < MAX_ROUTES) {
+                        if(oif == emak[0].ifx) { // wwan0
+                            if(!(copy = malloc(nlp->nlmsg_len))) {
+                                fprintf(stderr, "Could not allocate memory.\n");
+                                return -1;
+                            }
+                            memcpy(copy, nlp, nlp->nlmsg_len);
+                            routes[n_routes++] = copy;
+                        }
+                    } else {
+                        fprintf(stderr, "Found too many routes.\n");
+                    }
                     break;
 
                 case RTA_PRIORITY:
@@ -480,35 +567,21 @@ void read_reply(int fd) {
                 if(ci->ifx == oif) {
                     ci->metric = metric;
                     active_cnt++;
-                    printf("%10s[%d] metric : %d  gw %s\n", ci->interface, ci->ifx, ci->metric, ip);
                     break;
                 }
             }
         }
     }
+    printf("Cached %d wwan0 routes\n", n_routes);
+
+    return 0;
 }
 
-// void read_routes() {
-//     char buf[132];
-//     int sz;
-//     FILE *f = fopen("/proc/net/route", "r");
-//     if(f) {
-//         while(!feof(f)) {
-//             fgets(buf, 132, f);
-//             sz = strlen(buf);
-//             if(sz) buf[sz-1] = 0;
-//             printf("Read [%s]\n", buf);
-//         }
-//     } else {
-//         printf("Error opening routes\n");
-//     }
-// }
-
-void read_metrics(int fd) {
+int read_routes(int fd) {
     struct {
         struct nlmsghdr nl;
         struct rtmsg    rt;
-        char            buf[8192];
+        // char            buf[8192];
     } req;
     int r;
 
@@ -542,25 +615,15 @@ void read_metrics(int fd) {
     r = sendmsg(fd, &msg, 0);
     if(r < 0) {
         fprintf(stderr, "Sendmsg error: %s\n", strerror(errno));
-        return;
+        return -1;
     }
-    read_reply(fd);
-}
-
-void read_interfaces() {
-    connection_info_t *ci;
-    int i;
-    for (i = 0; i < 2; i++) {
-        ci = emak + i;
-        ci->ifx = if_nametoindex(ci->interface);
-        printf("%10s: %d\n", ci->interface, ci->ifx);
-    }
+    return read_reply_routes(fd);
 }
 
 int main() {
-    connection_info_t *ci;
     struct sysinfo si;
-    int i, r, last = 0, stop = 0, run = 0;
+    int i, r = 0, last = 0, stop = 0, run = 0;
+    int tmp = 0;
 
     netlink_sck = netlink_open();
     if(netlink_sck < 0) {
@@ -570,48 +633,45 @@ int main() {
 
     pthread_mutex_init(&mtx_signal, NULL);
 
+    memset(routes, 0, 64 * sizeof(struct nlmsghdr *));
+
     signal(SIGUSR1, sigusr1_handler);
     signal(SIGUSR2, sigusr2_handler);
 
     tmLast = time(NULL);
 
     read_config();
-    read_interfaces();
-    read_interfaces_old(netlink_sck);
+    if(read_interfaces(netlink_sck)) {
+        fprintf(stderr, "Error getting interfaces!\n");
+        r = 1;
+    }
+    for(i = 0; i < 2; i++) {
+        if(emak[i].ifx < 0) {
+            fprintf(stderr, "Interface %s not found!\n", emak[i].interface);
+            r = 1;
+        }
+    }
+    if(r) {
+        goto finish;
+    }
 
     while(1) {
         sysinfo(&si);
-        if(last == 0 || si.uptime > last + 60 || run) {
-            read_metrics(netlink_sck);
+        if(last == 0 || si.uptime > last + 10 || run) {
+            read_routes(netlink_sck);
             if(active_cnt > 1) {
+                printf("------- up=%ld\n", si.uptime);
                 check_interfaces();
-                for (i = 0; i < 2; i++) {
-                    ci = emak + i;
-                    printf("%10s: ", ci->interface);
-                    r = check_interface(ci->interface, &server);
-                    ci->valid = r;
-                    if(r < 0) {
-                        ci->valid = 0;
-                        // no connection
-                        printf("no access [%s]\n", strerror(check_error));
-                    } else if(r == 0) {
-                        ci->valid = 1;
-                        // has connection
-                        printf("has access\n");
-                    } else {
-                        ci->valid = 0;
-                        // check error
-                        printf("error %d\n", r);
-                    }
-                    g_stop = 1;
-                }
-                last = si.uptime;
-                if(run) {
-                    run = 0;
-                    pthread_mutex_lock(&mtx_signal);
-                    g_run = 0;
-                    pthread_mutex_unlock(&mtx_signal);
-                }
+            }
+            last = si.uptime;
+            if(run) {
+                pthread_mutex_lock(&mtx_signal);
+                g_run = 0;
+                pthread_mutex_unlock(&mtx_signal);
+            }
+            tmp++;
+            if(tmp > 20) {
+                g_stop = 1;
             }
         }
         pthread_mutex_lock(&mtx_signal);
@@ -620,6 +680,8 @@ int main() {
         pthread_mutex_unlock(&mtx_signal);
         if(stop) break;
     }
+
+finish:
     pthread_mutex_destroy(&mtx_signal);
     close(netlink_sck);
     return 0;
