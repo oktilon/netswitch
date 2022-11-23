@@ -9,10 +9,10 @@ if meson.is_cross_build()
     sim_ifa = 'wwan0'
     sim_con = 'telenor'
 else
-    eth_ifa = 'enp43s0'
-    eth_con = 'Wired'
-    sim_ifa = 'wlp0s20f3'
-    sim_con = 'Lanars_Community'
+    eth_ifa = 'br-ecb47c45ef18'
+    eth_con = 'br-ecb47c45ef18'
+    sim_ifa = 'docker0'
+    sim_con = 'docker0'
 endif
 
 # Set config
@@ -32,7 +32,6 @@ configure_file(
 # inc = include_directories(['include', 'lib'])
 src = [
       'src/app.c'
-    , 'src/getifn.c'
     , 'src/nlrequest.c'
 ]
 

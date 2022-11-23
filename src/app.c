@@ -3,6 +3,7 @@
 #include <strings.h>
 #include <stdlib.h>
 #include <time.h>
+#include <assert.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <netdb.h>
@@ -26,7 +27,6 @@
 
 #include "app.h"
 #include "nlrequest.h"
-#include "getifn.h"
 
 #define  SERVER_CONFIG          "/home/defigo/.config/Doorbell ink/Doorbell.conf"
 #define  SERVER_OPTION          "url="
@@ -49,7 +49,7 @@ time_t time1 = 0;
 time_t time2 = 0;
 
 typedef struct connection_info_s {
-    char interface[10];
+    char interface[16];
     char name[24];
     int ifx;
     int metric;
@@ -82,7 +82,6 @@ void printTime(char *msg) {
     printf("%s %ld sec\n", msg, tm - tmLast);
     tmLast = tm;
 }
-
 
 const char* rta_type_name(unsigned short val) {
     static char ret[10] = {0};
@@ -260,41 +259,28 @@ void read_config() {
     fclose(fp);
 }
 
-int read_reply_ifn(int fd) {
-    char buf[8192];
+int parse_reply_interfaces(char *buf, int nll) {
     char *p;
-    int nll = 0, rtl, rtn, i;
+    int rtl, i;
     struct nlmsghdr *nlp;
-
-    bzero(buf, sizeof(buf));
-
-    p = buf;
-    nll = 0;
-
-    while(1) {
-        rtn = recv(fd, p, sizeof(buf) - nll, 0);
-        nlp = (struct nlmsghdr *) p;
-        if(nlp->nlmsg_type == NLMSG_DONE) break;
-        p += rtn;
-        nll += rtn;
-    }
-
     struct ifinfomsg *ifp;
     struct rtattr *ifap;
+
     nlp = (struct nlmsghdr *) buf;
     for(;NLMSG_OK(nlp, nll);nlp=NLMSG_NEXT(nlp, nll)) {
-        ifp = (struct ifinfomsg *) NLMSG_DATA(nlp);
-        ifap = (struct rtattr *) IFLA_RTA(ifp);
+        ifp = NLMSG_DATA(nlp);
+        ifap = IFLA_RTA(ifp);
         rtl = RTM_PAYLOAD(nlp);
+
         for(;RTA_OK(ifap, rtl);ifap=RTA_NEXT(ifap,rtl)) {
-            // print_data(ifap);
+            print_data(ifap);
             switch(ifap->rta_type) {
                 case IFLA_IFNAME:
                     p = RTA_DATA(ifap);
                     for(i = 0; i < 2; i++) {
                         if(strcmp(p, emak[i].interface) == 0) {
                             emak[i].ifx = ifp->ifi_index;
-                            // printf(">>> %d = %s\n", emak[i].ifx, p);
+                            printf(">>> %d = %s\n", emak[i].ifx, p);
                         }
                     }
                     break;
@@ -304,21 +290,15 @@ int read_reply_ifn(int fd) {
     return 0;
 }
 
-int read_interfaces(int fd) {
+int read_interfaces() {
     struct {
         struct nlmsghdr  nl;
         struct ifinfomsg i;
     } req;
-    int r;
+    int nll;
+    char *buf = NULL;
 
     bzero(&req, sizeof(req));
-
-    struct sockaddr_nl pa;
-    struct iovec iov;
-    struct msghdr msg;
-
-    bzero(&pa, sizeof(pa));
-    pa.nl_family = AF_NETLINK;
 
     // set the NETLINK header
     req.nl.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
@@ -329,27 +309,78 @@ int read_interfaces(int fd) {
     req.i.ifi_family = AF_UNSPEC;
     req.i.ifi_change = -1;
 
-    bzero(&iov, sizeof(iov));
-    iov.iov_base = (void * )&req.nl;
-    iov.iov_len = req.nl.nlmsg_len;
 
-    bzero(&msg, sizeof(msg));
-    msg.msg_name = (void*) &pa;
-    msg.msg_namelen = sizeof(pa);
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-
-    r = sendmsg(fd, &msg, 0);
-    if(r < 0) {
-        fprintf(stderr, "Sendmsg error: %s\n", strerror(errno));
-        return 1;
+    nll = netlink_request(netlink_sck, (void*)&req, &buf);
+    if(nll < 0) {
+        return -1;
     }
-    return read_reply_ifn(fd);
+    return parse_reply_interfaces(buf, nll);
 }
 
-    // SOCK_STREAM == TCP
-    // SOCK_DGRAM == UDP
-    // IP protocol == 0
+struct nlmsghdr* set_route_metric(struct nlmsghdr* n, int metric) {
+    struct rtmsg *r;
+    struct rtattr *a = NULL;
+    int l, t;
+
+    r = NLMSG_DATA(n);
+    l = NLMSG_PAYLOAD(n, sizeof(struct rtmsg));
+    a = RTM_RTA(r);
+
+    while(RTA_OK(a, l)) {
+        switch(a->rta_type) {
+            case RTA_PRIORITY:
+
+                if (RTA_PAYLOAD(a) != sizeof(int)) {
+                    fprintf(stderr, "NETLINK: Recieved corrupt RTA_PRIORITY payload.\n");
+                    return NULL;
+                }
+
+                *((int*) RTA_DATA(a)) = metric;
+                return n;
+        }
+
+        a = RTA_NEXT(a, l);
+    }
+
+    if ((n = realloc(n, (t = n->nlmsg_len+1024))))
+        addattr32(n, t, RTA_PRIORITY, metric);
+    else
+        fprintf(stderr, "realloc() failed.\n");
+
+    return n;
+}
+
+int delete_route(struct nlmsghdr* n) {
+
+    n->nlmsg_type = RTM_DELROUTE;
+    n->nlmsg_flags = NLM_F_REQUEST;
+
+    return netlink_request(netlink_sck, n, NULL);
+}
+
+int add_route(struct nlmsghdr* n) {
+
+    n->nlmsg_type = RTM_NEWROUTE;
+    n->nlmsg_flags = NLM_F_REQUEST|NLM_F_CREATE;
+
+    return netlink_request(netlink_sck, n, NULL);
+}
+
+int set_wireless_metric(int metric) {
+    int j;
+    if (n_routes) {
+        for (j = 0; j < n_routes; j++) {
+            if (delete_route(routes[j]) >= 0)
+                if ((routes[j] = set_route_metric(routes[j], metric)))
+                    add_route(routes[j]);
+
+            free(routes[j]);
+            routes[j] = NULL;
+        }
+    }
+    return 0;
+}
+
 int check_interface(char *ifa_name) {
     int r;
     struct sockaddr_in addr;
@@ -417,40 +448,32 @@ void check_interfaces() {
         ci = emak + i;
         printf("%10s: ", ci->interface);
         r = check_interface(ci->interface);
-        switch(r) {
-            case 1:
-            case 2:
-            case 3:
-                // internal error
-                ci->valid = 0;
-                break;
-
-            case 4:
-        }
+        ci->valid = r == 0 ? 1 : 0;
         if(ci->valid) {
             printf("has access");
         } else {
             printf("no access");
+            if(r == 4) {
+                printf(" [so_error=%d]", check_error);
+            } else {
+                printf(" [%s]", strerror(check_error));
+            }
         }
         printf("\n");
     }
     if(emak[ETH].valid && emak[MOB].metric < 700) {
-        // set MOB metric = 710
+        set_wireless_metric(710);
         printf("Switch to Ethernet\n");
     }
     if(!emak[ETH].valid && emak[MOB].valid && emak[MOB].metric > 700) {
-        // set MOB metric = 10
+        set_wireless_metric(10);
         printf("Switch to Wireless\n");
     }
 }
 
-int read_reply_routes(int fd) {
-    // string to hold content of the route
-    // table (i.e. one entry)
-    char buf[8192];
+int parse_reply_routes(char *buf, int nll) {
     char ip[25];
-    char *p;
-    int nll = 0, rtl, rtn, i;
+    int rtl, i;
     struct nlmsghdr *nlp;
     struct nlmsghdr **nlpp;
     connection_info_t *ci;
@@ -461,40 +484,7 @@ int read_reply_routes(int fd) {
         (*nlpp++) = 0;
     }
     n_routes = 0;
-
-
-    // initialize the socket read buffer
-    bzero(buf, sizeof(buf));
-
-    p = buf;
-    nll = 0;
     active_cnt = 0;
-
-    // read from the socket until the NLMSG_DONE is
-    // returned in the type of the RTNETLINK message
-    // or if it was a monitoring socket
-    while(1) {
-        rtn = recv(fd, p, sizeof(buf) - nll, 0);
-
-        nlp = (struct nlmsghdr *) p;
-
-        if(nlp->nlmsg_type == NLMSG_DONE)
-        break;
-
-        // increment the buffer pointer to place
-        // next message
-        p += rtn;
-
-        // increment the total size by the size of
-        // the last received message
-        nll += rtn;
-
-        // if((la.nl_groups & RTMGRP_IPV4_ROUTE)
-        //                 == RTMGRP_IPV4_ROUTE)
-        // break;
-    }
-
-
 
     struct rtmsg *rtp;
     struct rtattr *rtap;
@@ -577,20 +567,14 @@ int read_reply_routes(int fd) {
     return 0;
 }
 
-int read_routes(int fd) {
+int read_routes() {
     struct {
         struct nlmsghdr nl;
         struct rtmsg    rt;
-        // char            buf[8192];
     } req;
-    int r;
+    int nll;
+    char *buf = NULL;
 
-    struct sockaddr_nl pa;
-    struct iovec iov;
-    struct msghdr msg;
-
-    bzero(&pa, sizeof(pa));
-    pa.nl_family = AF_NETLINK;
 
     bzero(&req, sizeof(req));
     // set the NETLINK header
@@ -602,22 +586,11 @@ int read_routes(int fd) {
     req.rt.rtm_family = AF_INET;
     req.rt.rtm_table = RT_TABLE_MAIN;
 
-    bzero(&iov, sizeof(iov));
-    iov.iov_base = (void * )&req.nl;
-    iov.iov_len = req.nl.nlmsg_len;
-
-    bzero(&msg, sizeof(msg));
-    msg.msg_name = (void*) &pa;
-    msg.msg_namelen = sizeof(pa);
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-
-    r = sendmsg(fd, &msg, 0);
-    if(r < 0) {
-        fprintf(stderr, "Sendmsg error: %s\n", strerror(errno));
+    nll = netlink_request(netlink_sck, (void*)&req, &buf);
+    if(nll < 0) {
         return -1;
     }
-    return read_reply_routes(fd);
+    return parse_reply_routes(buf, nll);
 }
 
 int main() {
@@ -641,7 +614,7 @@ int main() {
     tmLast = time(NULL);
 
     read_config();
-    if(read_interfaces(netlink_sck)) {
+    if(read_interfaces(netlink_sck) < 0) {
         fprintf(stderr, "Error getting interfaces!\n");
         r = 1;
     }

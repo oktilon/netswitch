@@ -6,6 +6,8 @@
 
 #include "nlrequest.h"
 
+char buf[8192];
+
 int netlink_open(void) {
     struct sockaddr_nl addr;
     int s;
@@ -29,65 +31,59 @@ int netlink_open(void) {
 }
 
 
-int netlink_request(int s, struct nlmsghdr *n, int (*callback) (struct nlmsghdr *n, void *u), void *u) {
+int netlink_request(int fd, struct nlmsghdr *n, char **data) {
     static int seq = 0;
-    pid_t pid = getpid();
-    assert(s >= 0 && n);
+    char *p;
+    int nll = 0, rtn;
+    struct nlmsghdr *nlp;
+    struct sockaddr_nl pa;
+    struct iovec iov;
+    struct msghdr msg;
+    assert(fd >= 0 && n);
 
     n->nlmsg_seq = seq++;
     n->nlmsg_flags |= NLM_F_ACK;
 
-    if (send(s, n, n->nlmsg_len, 0) < 0) {
-        fprintf(stderr, "NETLINK: send(): %s\n", strerror(errno));
+    bzero(buf, sizeof(buf));
+
+    bzero(&pa, sizeof(pa));
+    pa.nl_family = AF_NETLINK;
+
+
+    bzero(&iov, sizeof(iov));
+    iov.iov_base = (void * )n;
+    iov.iov_len = n->nlmsg_len;
+
+    bzero(&msg, sizeof(msg));
+    msg.msg_name = (void*) &pa;
+    msg.msg_namelen = sizeof(pa);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    if (sendmsg(fd, &msg, 0) < 0) {
+        fprintf(stderr, "Sendmsg error: %s\n", strerror(errno));
         return -1;
     }
 
-    for (;;) {
-        int bytes;
-        char replybuf[2048];
-        struct nlmsghdr *p = (struct nlmsghdr *) replybuf;
+    p = buf;
+    nll = 0;
 
-        if ((bytes = recv(s, &replybuf, sizeof(replybuf), 0)) < 0) {
-            fprintf(stderr, "recv(): %s\n", strerror(errno));
-            return -1;
-        }
+    while(1) {
+        rtn = recv(fd, p, sizeof(buf) - nll, 0);
 
-        for (; bytes > 0; p = NLMSG_NEXT(p, bytes)) {
-            int ret;
+        nlp = (struct nlmsghdr *) p;
 
-            if (!NLMSG_OK(p, bytes) || bytes < sizeof(struct nlmsghdr) || bytes < p->nlmsg_len) {
-                fprintf(stderr, "NETLINK: Packet too small or truncated! %u!=%lu!=%u\n", bytes, sizeof(struct nlmsghdr), p->nlmsg_len);
-                // return -1;
-            }
+        if(nlp->nlmsg_type == NLMSG_DONE) break;
 
-            if (p->nlmsg_type == NLMSG_DONE)
-                return 0;
-
-            if (p->nlmsg_type == NLMSG_ERROR) {
-                struct nlmsgerr *e = (struct nlmsgerr *) NLMSG_DATA (p);
-
-                if (e->error) {
-                    fprintf(stderr, "NETLINK: Error: %s\n", strerror(-e->error));
-                    return -1;
-                } else
-                    return 0;
-            }
-
-            if (p->nlmsg_pid != pid)
-                continue;
-
-            if (p->nlmsg_seq != n->nlmsg_seq) {
-                fprintf(stderr, "NETLINK: Received message with bogus sequence number!\n");
-                continue;
-            }
-
-            if (callback)
-                if ((ret = callback(p, u)) < 0)
-                    return ret;
-        }
+        p += rtn;
+        nll += rtn;
     }
 
-    return 0;
+    if(data) {
+        *data = buf;
+    }
+
+    return nll;
 }
 
 /*
