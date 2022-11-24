@@ -4,24 +4,19 @@ project(
     meson_version : '> 0.53.0')
 
 if meson.is_cross_build()
-    eth_ifa = 'eth0'
-    eth_con = 'Wired_connection_1'
-    sim_ifa = 'wwan0'
-    sim_con = 'telenor'
+    eth_ifn = 'eth0'
+    wan_ifn = 'wwan0'
 else
-    eth_ifa = 'br-ecb47c45ef18'
-    eth_con = 'br-ecb47c45ef18'
-    sim_ifa = 'docker0'
-    sim_con = 'docker0'
+    eth_ifn = 'br-ecb47c45ef18'
+    wan_ifn = 'docker0'
 endif
 
 # Set config
 # version_arr = meson.project_version().split('.')
 conf_data = configuration_data()
-conf_data.set('eth_ifa', eth_ifa)
-conf_data.set('eth_con', eth_con)
-conf_data.set('sim_ifa', sim_ifa)
-conf_data.set('sim_con', sim_con)
+conf_data.set('eth_ifn', eth_ifn)
+conf_data.set('wan_ifn', wan_ifn)
+conf_data.set('version', meson.project_version())
 configure_file(
     input         : 'app.h.in',
     output        : 'app.h',
@@ -36,14 +31,14 @@ src = [
 ]
 
 # Dependencies
-deps = [
-    dependency('threads')
-]
+# deps = [
+#     dependency('threads')
+# ]
 
 # Create executable
 executable(
     meson.project_name()
     , sources : src
-    , dependencies : deps
+    # , dependencies : deps
     # , include_directories : inc
 )

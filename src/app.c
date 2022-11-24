@@ -1,17 +1,27 @@
+/**
+ * NetSwitch utility
+ * Switches wireless connection priority (metric). Ethernet with the highest priority
+ * connection checked thru current Doorbell server (from application config file)
+ * - If there is only one connected interface - do nothing
+ * - If mobile and ethernet are available - mobile priority = 710
+ * - If mobile is available and ethernet is not - mobile priority = 10
+ *
+*/
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
 #include <time.h>
 #include <assert.h>
-#include <fcntl.h>
 #include <errno.h>
-#include <netdb.h>
-#include <memory.h>
-#include <unistd.h>
-#include <pthread.h>
-#include <signal.h>
+#include <fcntl.h>
+#include <getopt.h>
 #include <ifaddrs.h>
+#include <memory.h>
+#include <netdb.h>
+// #include <pthread.h>
+#include <signal.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 #include <asm/types.h>
 #include <bits/sockaddr.h>
@@ -35,52 +45,46 @@
 #define  CONNECT_TIMEOUT_uS     0
 
 int check_error = 0;
-time_t tmLast = 0;
 int g_stop = 0;
 int g_run = 0;
-pthread_mutex_t mtx_signal;
+int g_reload = 0;
 struct in_addr server = {0L};
 struct nlmsghdr *routes[MAX_ROUTES];
 int n_routes;
 int server_port = 0;
 int netlink_sck = 0;
 int active_cnt = 0;
-time_t time1 = 0;
-time_t time2 = 0;
+int verbose = 0;
+
+const struct option long_options[] = {
+    {"verbose", no_argument,        0,  'v'}
+};
 
 typedef struct connection_info_s {
-    char interface[16];
-    char name[24];
+    char interface[IFNAMSIZ + 1];
     int ifx;
     int metric;
-    int status;
     int valid;
 } connection_info_t;
 
 connection_info_t emak[2] = {
-    {MOB_INTERFACE, MOB_CONNECTION, -1, 0, 0, 0},
-    {ETH_INTERFACE, ETH_CONNECTION, -1, 0, 0, 0}
+    {ETH_INTERFACE, -1, 0, 0},
+    {MOB_INTERFACE, -1, 0, 0}
 };
 
 #define MOB 0
 #define ETH 1
 
-void sigusr1_handler(int sig) {
-    pthread_mutex_lock(&mtx_signal);
+void run_handler(int sig) {
     g_run = 1;
-    pthread_mutex_unlock(&mtx_signal);
 }
 
-void sigusr2_handler(int sig) {
-    pthread_mutex_lock(&mtx_signal);
+void stop_handler(int sig) {
     g_stop = 1;
-    pthread_mutex_unlock(&mtx_signal);
 }
 
-void printTime(char *msg) {
-    time_t tm = time(NULL);
-    printf("%s %ld sec\n", msg, tm - tmLast);
-    tmLast = tm;
+void reload_handler(int sig) {
+    g_reload = 1;
 }
 
 const char* rta_type_name(unsigned short val) {
@@ -189,26 +193,6 @@ const char* ifla_type_name(unsigned short val) {
     return ret;
 }
 
-void print_data(struct rtattr *rtap) {
-    int len = rtap->rta_len;
-    // char buf[256];
-    char *data = (((char*)(rtap)) + sizeof(struct rtattr));
-    printf("--- %s [sz=%d] =", ifla_type_name(rtap->rta_type), rtap->rta_len);
-    for(int i = 0; i < len; i++) {
-        printf(" %02X", data[i]);
-        if(i > 24) {
-            printf("...");
-            break;
-        }
-    }
-    switch(rtap->rta_type) {
-        case IFLA_IFNAME:
-            printf(" == %s", data);
-            break;
-    }
-    printf("\n");
-}
-
 void read_config() {
     char buf[256], ip[INET_ADDRSTRLEN];
     struct hostent *hp;
@@ -252,7 +236,8 @@ void read_config() {
                     server_port = 53;
                 }
                 inet_ntop(AF_INET, &server, ip, INET_ADDRSTRLEN);
-                printf("URL is [%s], ip=%s, port=%d\n", purl, ip, server_port);
+                if(verbose)
+                    printf("Use URL %s = %s:%d\n", purl, ip, server_port);
             }
         }
     }
@@ -261,7 +246,7 @@ void read_config() {
 
 int parse_reply_interfaces(char *buf, int nll) {
     char *p;
-    int rtl, i;
+    int rtl;
     struct nlmsghdr *nlp;
     struct ifinfomsg *ifp;
     struct rtattr *ifap;
@@ -273,15 +258,19 @@ int parse_reply_interfaces(char *buf, int nll) {
         rtl = RTM_PAYLOAD(nlp);
 
         for(;RTA_OK(ifap, rtl);ifap=RTA_NEXT(ifap,rtl)) {
-            print_data(ifap);
             switch(ifap->rta_type) {
                 case IFLA_IFNAME:
                     p = RTA_DATA(ifap);
-                    for(i = 0; i < 2; i++) {
-                        if(strcmp(p, emak[i].interface) == 0) {
-                            emak[i].ifx = ifp->ifi_index;
-                            printf(">>> %d = %s\n", emak[i].ifx, p);
-                        }
+                    if(p[0] == 'w') { // wireless
+                        emak[MOB].ifx = ifp->ifi_index;
+                        strncpy(emak[MOB].interface, p, IFNAMSIZ);
+                        if(verbose)
+                            printf("wireless %s index %d\n", p, emak[MOB].ifx);
+                    } else if(p[0] == 'e') { // ethernet
+                        emak[ETH].ifx = ifp->ifi_index;
+                        strncpy(emak[ETH].interface, p, IFNAMSIZ);
+                        if(verbose)
+                            printf("ethernet %s index %d\n", p, emak[ETH].ifx);
                     }
                     break;
             }
@@ -310,7 +299,7 @@ int read_interfaces() {
     req.i.ifi_change = -1;
 
 
-    nll = netlink_request(netlink_sck, (void*)&req, &buf);
+    nll = netlink_request(netlink_sck, (void*)&req, &buf, 0);
     if(nll < 0) {
         return -1;
     }
@@ -351,32 +340,33 @@ struct nlmsghdr* set_route_metric(struct nlmsghdr* n, int metric) {
 }
 
 int delete_route(struct nlmsghdr* n) {
-
     n->nlmsg_type = RTM_DELROUTE;
     n->nlmsg_flags = NLM_F_REQUEST;
 
-    return netlink_request(netlink_sck, n, NULL);
+    return netlink_request(netlink_sck, n, NULL, 1);
 }
 
 int add_route(struct nlmsghdr* n) {
-
     n->nlmsg_type = RTM_NEWROUTE;
     n->nlmsg_flags = NLM_F_REQUEST|NLM_F_CREATE;
 
-    return netlink_request(netlink_sck, n, NULL);
+    return netlink_request(netlink_sck, n, NULL, 1);
 }
 
 int set_wireless_metric(int metric) {
     int j;
     if (n_routes) {
         for (j = 0; j < n_routes; j++) {
-            if (delete_route(routes[j]) >= 0)
-                if ((routes[j] = set_route_metric(routes[j], metric)))
+            if (delete_route(routes[j]) >= 0) {
+                if ((routes[j] = set_route_metric(routes[j], metric))) {
                     add_route(routes[j]);
+                }
+            }
 
             free(routes[j]);
             routes[j] = NULL;
         }
+        n_routes = 0;
     }
     return 0;
 }
@@ -446,33 +436,38 @@ void check_interfaces() {
     int i, r;
     for (i = 0; i < 2; i++) {
         ci = emak + i;
-        printf("%10s: ", ci->interface);
+        if(verbose)
+            printf("%s: ", ci->interface);
         r = check_interface(ci->interface);
         ci->valid = r == 0 ? 1 : 0;
-        if(ci->valid) {
-            printf("has access");
-        } else {
-            printf("no access");
-            if(r == 4) {
-                printf(" [so_error=%d]", check_error);
+        if(!ci->valid && check_error == EINTR)
+            return;
+        if(verbose) {
+            if(ci->valid) {
+                printf("has access");
             } else {
-                printf(" [%s]", strerror(check_error));
+                printf("no access");
+                if(r == 4) {
+                    printf(" [so_error=%s]", strerror(check_error));
+                } else {
+                    printf(" [%s]", strerror(check_error));
+                }
             }
+            printf("\n");
         }
-        printf("\n");
     }
     if(emak[ETH].valid && emak[MOB].metric < 700) {
-        set_wireless_metric(710);
         printf("Switch to Ethernet\n");
+        set_wireless_metric(710);
     }
     if(!emak[ETH].valid && emak[MOB].valid && emak[MOB].metric > 700) {
-        set_wireless_metric(10);
         printf("Switch to Wireless\n");
+        set_wireless_metric(10);
     }
 }
 
 int parse_reply_routes(char *buf, int nll) {
-    char ip[25];
+    // char ip[25];
     int rtl, i;
     struct nlmsghdr *nlp;
     struct nlmsghdr **nlpp;
@@ -489,45 +484,29 @@ int parse_reply_routes(char *buf, int nll) {
     struct rtmsg *rtp;
     struct rtattr *rtap;
     struct nlmsghdr* copy;
-    // outer loop: loops thru all the NETLINK
-    // headers that also include the route entry
-    // header
+
     nlp = (struct nlmsghdr *) buf;
     for(;NLMSG_OK(nlp, nll);nlp=NLMSG_NEXT(nlp, nll)) {
-        // get route entry header
         rtp = (struct rtmsg *) NLMSG_DATA(nlp);
-
-        // we are only concerned about the
-        // main route table
         if(rtp->rtm_table != RT_TABLE_MAIN)
-        continue;
+            continue;
 
-        // inner loop: loop thru all the attributes of
-        // one route entry
         rtap = (struct rtattr *) RTM_RTA(rtp);
         rtl = RTM_PAYLOAD(nlp);
         int gateway = 0;
-        unsigned char oif_dmp[8];
-        unsigned char priority_dmp[8];
         int oif = 0;
         int metric = 0;
-        int len;
-        char *data;
         for(;RTA_OK(rtap, rtl);rtap=RTA_NEXT(rtap,rtl)) {
-            // print_data(rtap, rtp);
-            len = rtap->rta_len;
             switch(rtap->rta_type) {
                 case RTA_GATEWAY:
                     gateway = 1;
-                    inet_ntop(AF_INET, RTA_DATA(rtap), ip, 25);
+                    // inet_ntop(AF_INET, RTA_DATA(rtap), ip, 25);
                     break;
 
                 case RTA_OIF:
                     oif = *((int *) RTA_DATA(rtap));
-                    data = (((char*)(rtap)) + sizeof(struct rtattr));
-                    bcopy(data, oif_dmp, MIN(8, len));
                     if(n_routes < MAX_ROUTES) {
-                        if(oif == emak[0].ifx) { // wwan0
+                        if(oif == emak[MOB].ifx) { // wwan0
                             if(!(copy = malloc(nlp->nlmsg_len))) {
                                 fprintf(stderr, "Could not allocate memory.\n");
                                 return -1;
@@ -542,8 +521,6 @@ int parse_reply_routes(char *buf, int nll) {
 
                 case RTA_PRIORITY:
                     metric = *((int *) RTA_DATA(rtap));
-                    data = (((char*)(rtap)) + sizeof(struct rtattr));
-                    bcopy(data, priority_dmp, MIN(8, len));
                     break;
 
                 default:
@@ -562,7 +539,6 @@ int parse_reply_routes(char *buf, int nll) {
             }
         }
     }
-    printf("Cached %d wwan0 routes\n", n_routes);
 
     return 0;
 }
@@ -577,26 +553,36 @@ int read_routes() {
 
 
     bzero(&req, sizeof(req));
-    // set the NETLINK header
     req.nl.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
     req.nl.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
     req.nl.nlmsg_type = RTM_GETROUTE;
 
-    // set the routing message header
     req.rt.rtm_family = AF_INET;
     req.rt.rtm_table = RT_TABLE_MAIN;
 
-    nll = netlink_request(netlink_sck, (void*)&req, &buf);
+    nll = netlink_request(netlink_sck, (void*)&req, &buf, 0);
     if(nll < 0) {
         return -1;
     }
     return parse_reply_routes(buf, nll);
 }
 
-int main() {
+int main(int argc, char *argv[]) {
     struct sysinfo si;
-    int i, r = 0, last = 0, stop = 0, run = 0;
-    int tmp = 0;
+    int i, r = 0, last = 0;
+
+    printf("NetSwitch utility v.%s started\n", VERSION);
+
+    while ((i = getopt_long(argc, argv, "v", long_options, NULL)) != -1) {
+        switch(i) {
+            case 'v':
+                verbose = 1;
+                break;
+
+            default:
+                break;
+        }
+    }
 
     netlink_sck = netlink_open();
     if(netlink_sck < 0) {
@@ -604,15 +590,14 @@ int main() {
         return 1;
     }
 
-    pthread_mutex_init(&mtx_signal, NULL);
-
     memset(routes, 0, 64 * sizeof(struct nlmsghdr *));
 
-    signal(SIGUSR1, sigusr1_handler);
-    signal(SIGUSR2, sigusr2_handler);
+    signal(SIGUSR1, run_handler);
+    signal(SIGUSR2, stop_handler);
+    signal(SIGHUP, reload_handler);
 
-    tmLast = time(NULL);
-
+reload:
+    g_reload = 0;
     read_config();
     if(read_interfaces(netlink_sck) < 0) {
         fprintf(stderr, "Error getting interfaces!\n");
@@ -628,34 +613,25 @@ int main() {
         goto finish;
     }
 
-    while(1) {
+    while(!g_stop) {
         sysinfo(&si);
-        if(last == 0 || si.uptime > last + 10 || run) {
+        if(last == 0 || si.uptime > last + 10 || g_run) {
             read_routes(netlink_sck);
             if(active_cnt > 1) {
-                printf("------- up=%ld\n", si.uptime);
                 check_interfaces();
             }
             last = si.uptime;
-            if(run) {
-                pthread_mutex_lock(&mtx_signal);
+            if(g_run) {
                 g_run = 0;
-                pthread_mutex_unlock(&mtx_signal);
-            }
-            tmp++;
-            if(tmp > 20) {
-                g_stop = 1;
             }
         }
-        pthread_mutex_lock(&mtx_signal);
-        stop = g_stop;
-        run = g_run;
-        pthread_mutex_unlock(&mtx_signal);
-        if(stop) break;
+        if(g_reload) {
+            goto reload;
+        }
     }
+    printf("Stopped by SIGUSR2\n");
 
 finish:
-    pthread_mutex_destroy(&mtx_signal);
     close(netlink_sck);
     return 0;
 }

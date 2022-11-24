@@ -7,7 +7,7 @@
 #include <linux/rtnetlink.h>
 #include <linux/if.h>
 
-int netlink_request(int fd, struct nlmsghdr *n, char **data);
+int netlink_request(int fd, struct nlmsghdr *n, char **data, int dont_wait);
 
 int addattr32(struct nlmsghdr *n, int maxlen, int type, int data);
 int addattr_l(struct nlmsghdr *n, int maxlen, int type, void *data, int alen);

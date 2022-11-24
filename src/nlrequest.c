@@ -31,7 +31,7 @@ int netlink_open(void) {
 }
 
 
-int netlink_request(int fd, struct nlmsghdr *n, char **data) {
+int netlink_request(int fd, struct nlmsghdr *n, char **data, int dont_wait) {
     static int seq = 0;
     char *p;
     int nll = 0, rtn;
@@ -65,22 +65,23 @@ int netlink_request(int fd, struct nlmsghdr *n, char **data) {
         return -1;
     }
 
-    p = buf;
-    nll = 0;
+    if(!dont_wait) {
+        p = buf;
 
-    while(1) {
-        rtn = recv(fd, p, sizeof(buf) - nll, 0);
+        while(1) {
+            rtn = recv(fd, p, sizeof(buf) - nll, 0);
 
-        nlp = (struct nlmsghdr *) p;
+            nlp = (struct nlmsghdr *) p;
 
-        if(nlp->nlmsg_type == NLMSG_DONE) break;
+            if(nlp->nlmsg_type == NLMSG_DONE) break;
 
-        p += rtn;
-        nll += rtn;
-    }
+            p += rtn;
+            nll += rtn;
+        }
 
-    if(data) {
-        *data = buf;
+        if(data) {
+            *data = buf;
+        }
     }
 
     return nll;

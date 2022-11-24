@@ -1,0 +1,14 @@
+[Unit]
+Description=NetSwitch utility
+Wants=network.target
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/defigo/netswitch
+ExecReload=kill -HUP $MAINPID
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
