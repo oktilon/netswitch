@@ -4,3 +4,6 @@
 #define MIN(a,b)        ((a<b) ? (a) : (b))
 
 #define VERSION         "@version@"
+
+void logger(const char *format, ...);
+void elogger(const char *format, ...);

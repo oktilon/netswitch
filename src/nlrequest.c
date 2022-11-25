@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <unistd.h>
 
+#include "app.h"
 #include "nlrequest.h"
 
 char buf[8192];
@@ -13,7 +14,7 @@ int netlink_open(void) {
     int s;
                               //SOCK_DGRAM
     if ((s = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE)) < 0) {
-        fprintf(stderr, "socket(PF_NETLINK): %s\n", strerror(errno));
+        logger("socket(PF_NETLINK): %s", strerror(errno));
         return -1;
     }
 
@@ -23,7 +24,7 @@ int netlink_open(void) {
     addr.nl_pid = getpid();
 
     if (bind(s, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "bind(): %s\n", strerror(errno));
+        logger("bind(): %s", strerror(errno));
         return -1;
     }
 
@@ -61,7 +62,7 @@ int netlink_request(int fd, struct nlmsghdr *n, char **data, int dont_wait) {
     msg.msg_iovlen = 1;
 
     if (sendmsg(fd, &msg, 0) < 0) {
-        fprintf(stderr, "Sendmsg error: %s\n", strerror(errno));
+        logger("Sendmsg error: %s", strerror(errno));
         return -1;
     }
 

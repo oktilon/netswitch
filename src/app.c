@@ -19,8 +19,9 @@
 #include <ifaddrs.h>
 #include <memory.h>
 #include <netdb.h>
-// #include <pthread.h>
 #include <signal.h>
+#include <stdarg.h>
+#include <syslog.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <asm/types.h>
@@ -40,14 +41,19 @@
 
 #define  SERVER_CONFIG          "/home/defigo/.config/Doorbell ink/Doorbell.conf"
 #define  SERVER_OPTION          "url="
+#define  MAIN_APPLICATION       "RtmpBroadcaster"
 #define  MAX_ROUTES             64
 #define  CONNECT_TIMEOUT_S      5
 #define  CONNECT_TIMEOUT_uS     0
+
+#define SIGNAL_MAIN_APP(SIG)    return signal_main_app(SIG, #SIG)
 
 int check_error = 0;
 int g_stop = 0;
 int g_run = 0;
 int g_reload = 0;
+int g_wait = 0;
+int wait_max;
 struct in_addr server = {0L};
 struct nlmsghdr *routes[MAX_ROUTES];
 int n_routes;
@@ -55,6 +61,7 @@ int server_port = 0;
 int netlink_sck = 0;
 int active_cnt = 0;
 int verbose = 0;
+int switch_to = -1;
 
 const struct option long_options[] = {
     {"verbose", no_argument,        0,  'v'}
@@ -65,15 +72,30 @@ typedef struct connection_info_s {
     int ifx;
     int metric;
     int valid;
+    int active;
 } connection_info_t;
 
 connection_info_t emak[2] = {
-    {ETH_INTERFACE, -1, 0, 0},
-    {MOB_INTERFACE, -1, 0, 0}
+    {ETH_INTERFACE, -1, 0, 0, 0},
+    {MOB_INTERFACE, -1, 0, 0, 0}
 };
 
 #define MOB 0
 #define ETH 1
+
+void logger(const char *format, ...) {
+    va_list vl;
+    va_start(vl, format);
+    vsyslog(LOG_WARNING, format, vl);
+    va_end(vl);
+}
+
+void elogger(const char *format, ...) {
+    va_list vl;
+    va_start(vl, format);
+    vsyslog(LOG_ERR, format, vl);
+    va_end(vl);
+}
 
 void run_handler(int sig) {
     g_run = 1;
@@ -81,6 +103,10 @@ void run_handler(int sig) {
 
 void stop_handler(int sig) {
     g_stop = 1;
+}
+
+void wait_handler(int sig) {
+    g_wait = 0;
 }
 
 void reload_handler(int sig) {
@@ -202,7 +228,7 @@ void read_config() {
     if(!fp) {
         server.s_addr = 0x08080808;
         server_port = 53;
-        fprintf(stderr, "Unable to open config file [%d], use ip=8.8.8.8, port=53\n", errno);
+        elogger("Unable to open config file [%d], use ip=8.8.8.8, port=53", errno);
         return;
     }
     szn = strlen(SERVER_OPTION);
@@ -237,7 +263,7 @@ void read_config() {
                 }
                 inet_ntop(AF_INET, &server, ip, INET_ADDRSTRLEN);
                 if(verbose)
-                    printf("Use URL %s = %s:%d\n", purl, ip, server_port);
+                    logger("Use URL %s = %s:%d", purl, ip, server_port);
             }
         }
     }
@@ -265,12 +291,12 @@ int parse_reply_interfaces(char *buf, int nll) {
                         emak[MOB].ifx = ifp->ifi_index;
                         strncpy(emak[MOB].interface, p, IFNAMSIZ);
                         if(verbose)
-                            printf("wireless %s index %d\n", p, emak[MOB].ifx);
+                            logger("wireless %s index %d", p, emak[MOB].ifx);
                     } else if(p[0] == 'e') { // ethernet
                         emak[ETH].ifx = ifp->ifi_index;
                         strncpy(emak[ETH].interface, p, IFNAMSIZ);
                         if(verbose)
-                            printf("ethernet %s index %d\n", p, emak[ETH].ifx);
+                            logger("ethernet %s index %d", p, emak[ETH].ifx);
                     }
                     break;
             }
@@ -320,7 +346,7 @@ struct nlmsghdr* set_route_metric(struct nlmsghdr* n, int metric) {
             case RTA_PRIORITY:
 
                 if (RTA_PAYLOAD(a) != sizeof(int)) {
-                    fprintf(stderr, "NETLINK: Recieved corrupt RTA_PRIORITY payload.\n");
+                    elogger("NETLINK: Recieved corrupt RTA_PRIORITY payload.");
                     return NULL;
                 }
 
@@ -334,7 +360,7 @@ struct nlmsghdr* set_route_metric(struct nlmsghdr* n, int metric) {
     if ((n = realloc(n, (t = n->nlmsg_len+1024))))
         addattr32(n, t, RTA_PRIORITY, metric);
     else
-        fprintf(stderr, "realloc() failed.\n");
+        elogger("realloc() failed.");
 
     return n;
 }
@@ -379,13 +405,13 @@ int check_interface(char *ifa_name) {
     int sock = socket( AF_INET, SOCK_STREAM, 0 );
 
     if(sock < 0) {
-        fprintf(stderr, "Unable to create socket for %s : (%d) %s\n", ifa_name, errno, strerror(errno));
+        elogger("Unable to create socket for %s : (%d) %s", ifa_name, errno, strerror(errno));
         return 1;
     }
 
     r = fcntl(sock, F_SETFL, O_NONBLOCK);
     if(r < 0) {
-        fprintf(stderr, "Unable to fcntl socket for %s : (%d) %s\n", ifa_name, errno, strerror(errno));
+        elogger("Unable to fcntl socket for %s : (%d) %s", ifa_name, errno, strerror(errno));
         close(sock);
         return 2;
     }
@@ -396,7 +422,7 @@ int check_interface(char *ifa_name) {
     addr.sin_addr = server;
     r = setsockopt( sock, SOL_SOCKET, SO_BINDTODEVICE, ifa_name, strlen(ifa_name) );
     if(r < 0) {
-        fprintf(stderr, "Unable setsockopt for %s : (%d) %s\n", ifa_name, errno, strerror(errno));
+        elogger("Unable setsockopt for %s : (%d) %s", ifa_name, errno, strerror(errno));
         close(sock);
         return 3;
     }
@@ -431,38 +457,77 @@ int check_interface(char *ifa_name) {
     return r;
 }
 
+int signal_main_app(int sig, const char *sig_name) {
+    char buf[512] = {0};
+    FILE *cmd_pipe = popen("pidof -s " MAIN_APPLICATION, "r");
+
+    fgets(buf, 512, cmd_pipe);
+    pid_t pid = strtoul(buf, NULL, 10);
+
+    pclose( cmd_pipe );
+
+    if(pid && !g_run) {
+        kill(pid, sig);
+        if(verbose)
+            logger("Signal main app [%d] %s", pid, sig_name);
+        sleep(3);
+        return 1;
+    }
+    return 0;
+}
+
+int reconnect_main_app() {
+    SIGNAL_MAIN_APP(SIGUSR1);
+}
+int restart_main_app() {
+    SIGNAL_MAIN_APP(SIGKILL);
+}
+
 void check_interfaces() {
+    struct sysinfo si;
     connection_info_t *ci;
-    int i, r;
+    int i, r, sw = -1;
+    char act[4] = {0};
     for (i = 0; i < 2; i++) {
         ci = emak + i;
-        if(verbose)
-            printf("%s: ", ci->interface);
+        if(ci->active) {
+            strcpy(act, "(*)");
+        } else {
+            strcpy(act, "");
+        }
+
         r = check_interface(ci->interface);
         ci->valid = r == 0 ? 1 : 0;
         if(!ci->valid && check_error == EINTR)
             return;
         if(verbose) {
             if(ci->valid) {
-                printf("has access");
+                logger("%s%s: has access", ci->interface, act);
             } else {
-                printf("no access");
-                if(r == 4) {
-                    printf(" [so_error=%s]", strerror(check_error));
-                } else {
-                    printf(" [%s]", strerror(check_error));
-                }
+                logger("%s%s: no access [%s]", ci->interface, act, strerror(check_error));
             }
-            printf("\n");
         }
     }
+
+    sysinfo(&si);
+
     if(emak[ETH].valid && emak[MOB].metric < 700) {
-        printf("Switch to Ethernet\n");
-        set_wireless_metric(710);
+        sw = ETH;
     }
     if(!emak[ETH].valid && emak[MOB].valid && emak[MOB].metric > 700) {
-        printf("Switch to Wireless\n");
-        set_wireless_metric(10);
+        sw = MOB;
+    }
+
+    if(sw >= 0) {
+        r = reconnect_main_app();
+        switch_to = sw;
+        if(r) {
+            g_wait = 1;
+            wait_max = si.uptime + 20;
+            logger("Wait app to disconnect");
+        } else {
+            g_wait = 0;
+        }
     }
 }
 
@@ -508,14 +573,14 @@ int parse_reply_routes(char *buf, int nll) {
                     if(n_routes < MAX_ROUTES) {
                         if(oif == emak[MOB].ifx) { // wwan0
                             if(!(copy = malloc(nlp->nlmsg_len))) {
-                                fprintf(stderr, "Could not allocate memory.\n");
+                                elogger("Could not allocate memory.");
                                 return -1;
                             }
                             memcpy(copy, nlp, nlp->nlmsg_len);
                             routes[n_routes++] = copy;
                         }
                     } else {
-                        fprintf(stderr, "Found too many routes.\n");
+                        elogger("Found too many routes.");
                     }
                     break;
 
@@ -533,10 +598,19 @@ int parse_reply_routes(char *buf, int nll) {
                 ci = emak + i;
                 if(ci->ifx == oif) {
                     ci->metric = metric;
+                    ci->active = 1;
                     active_cnt++;
                     break;
                 }
             }
+        }
+    }
+
+    if(active_cnt > 1) {
+        if(emak[MOB].metric < emak[ETH].metric) {
+            emak[ETH].active = 0;
+        } else {
+            emak[MOB].active = 0;
         }
     }
 
@@ -551,6 +625,11 @@ int read_routes() {
     int nll;
     char *buf = NULL;
 
+    for(nll = 0; nll < 2; nll++) {
+        emak[nll].active = 0;
+        emak[nll].metric = 0;
+        emak[nll].valid = 0;
+    }
 
     bzero(&req, sizeof(req));
     req.nl.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
@@ -571,7 +650,8 @@ int main(int argc, char *argv[]) {
     struct sysinfo si;
     int i, r = 0, last = 0;
 
-    printf("NetSwitch utility v.%s started\n", VERSION);
+    openlog("netswitch", LOG_NDELAY | LOG_PID, LOG_USER);
+    logger("NetSwitch utility v.%s started", VERSION);
 
     while ((i = getopt_long(argc, argv, "v", long_options, NULL)) != -1) {
         switch(i) {
@@ -586,26 +666,27 @@ int main(int argc, char *argv[]) {
 
     netlink_sck = netlink_open();
     if(netlink_sck < 0) {
-        fprintf(stderr, "NETLINK open error\n");
+        elogger("NETLINK open error");
         return 1;
     }
 
     memset(routes, 0, 64 * sizeof(struct nlmsghdr *));
 
     signal(SIGUSR1, run_handler);
-    signal(SIGUSR2, stop_handler);
+    signal(SIGUSR2, wait_handler);
     signal(SIGHUP, reload_handler);
+    signal(SIGTERM, stop_handler);
 
 reload:
     g_reload = 0;
     read_config();
     if(read_interfaces(netlink_sck) < 0) {
-        fprintf(stderr, "Error getting interfaces!\n");
+        elogger("Error getting interfaces!");
         r = 1;
     }
     for(i = 0; i < 2; i++) {
         if(emak[i].ifx < 0) {
-            fprintf(stderr, "Interface %s not found!\n", emak[i].interface);
+            elogger("Interface %s not found!", emak[i].interface);
             r = 1;
         }
     }
@@ -615,21 +696,41 @@ reload:
 
     while(!g_stop) {
         sysinfo(&si);
-        if(last == 0 || si.uptime > last + 10 || g_run) {
-            read_routes(netlink_sck);
-            if(active_cnt > 1) {
-                check_interfaces();
-            }
-            last = si.uptime;
-            if(g_run) {
-                g_run = 0;
+        if(g_wait) {
+            if(si.uptime > wait_max) {
+                g_wait = 0;
+                logger("Wait app timeout. Kill app");
+                restart_main_app();
             }
         }
-        if(g_reload) {
-            goto reload;
+        if(!g_wait) {
+            if(switch_to >= 0) {
+                if(switch_to == MOB) {
+                    logger("Switch to Wireless");
+                    set_wireless_metric(10);
+                } else if(switch_to == ETH) {
+                    logger("Switch to Ethernet");
+                    set_wireless_metric(710);
+                }
+                switch_to = -1;
+            } else {
+                if(last == 0 || si.uptime > last + 10 || g_run) {
+                    read_routes(netlink_sck);
+                    if(active_cnt > 1) {
+                        check_interfaces();
+                    }
+                    last = si.uptime;
+                    if(g_run) {
+                        g_run = 0;
+                    }
+                }
+                if(g_reload) {
+                    goto reload;
+                }
+            }
         }
     }
-    printf("Stopped by SIGUSR2\n");
+    logger("Stopped by SIGTERM");
 
 finish:
     close(netlink_sck);
