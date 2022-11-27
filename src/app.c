@@ -39,12 +39,15 @@
 #include "app.h"
 #include "nlrequest.h"
 
-#define  SERVER_CONFIG          "/home/defigo/.config/Doorbell ink/Doorbell.conf"
-#define  SERVER_OPTION          "url="
-#define  MAIN_APPLICATION       "RtmpBroadcaster"
-#define  MAX_ROUTES             64
-#define  CONNECT_TIMEOUT_S      5
-#define  CONNECT_TIMEOUT_uS     0
+#define  SERVER_CONFIG              "/home/defigo/.config/Doorbell ink/Doorbell.conf"
+#define  SERVER_OPTION              "url="
+#define  MAIN_APPLICATION           "RtmpBroadcaster"
+#define  CHECK_INTERVAL_S           10
+#define  WAIT_ANSWER_TIMEOUT_S      30
+#define  WAIT_RECONNECT_TIMEOUT_S   30
+#define  MAX_ROUTES                 64
+#define  CONNECT_TIMEOUT_S          5
+#define  CONNECT_TIMEOUT_uS         0
 
 #define SIGNAL_MAIN_APP(SIG)    return signal_main_app(SIG, #SIG)
 
@@ -95,10 +98,6 @@ void elogger(const char *format, ...) {
     va_start(vl, format);
     vsyslog(LOG_ERR, format, vl);
     va_end(vl);
-}
-
-void run_handler(int sig) {
-    g_run = 1;
 }
 
 void stop_handler(int sig) {
@@ -486,8 +485,12 @@ int restart_main_app() {
 void check_interfaces() {
     struct sysinfo si;
     connection_info_t *ci;
-    int i, r, sw = -1;
     char act[4] = {0};
+    int i,
+        r,
+        sig = 0,
+        sw = -1,
+        tout = 0;
     for (i = 0; i < 2; i++) {
         ci = emak + i;
         if(ci->active) {
@@ -513,17 +516,20 @@ void check_interfaces() {
 
     if(emak[ETH].valid && emak[MOB].metric < 700) {
         sw = ETH;
+        tout = WAIT_ANSWER_TIMEOUT_S;
+        sig = emak[MOB].valid ? 1 : 0;
     }
     if(!emak[ETH].valid && emak[MOB].valid && emak[MOB].metric > 700) {
         sw = MOB;
+        tout = WAIT_RECONNECT_TIMEOUT_S;
     }
 
     if(sw >= 0) {
-        r = reconnect_main_app();
         switch_to = sw;
-        if(r) {
+        sig = sig ? reconnect_main_app() : 1;
+        if(sig) {
             g_wait = 1;
-            wait_max = si.uptime + 20;
+            wait_max = si.uptime + tout;
             logger("Wait app to disconnect");
         } else {
             g_wait = 0;
@@ -648,7 +654,7 @@ int read_routes() {
 
 int main(int argc, char *argv[]) {
     struct sysinfo si;
-    int i, r = 0, last = 0;
+    int i, r = 0, next = 0;
 
     openlog("netswitch", LOG_NDELAY | LOG_PID, LOG_USER);
     logger("NetSwitch utility v.%s started", VERSION);
@@ -672,13 +678,17 @@ int main(int argc, char *argv[]) {
 
     memset(routes, 0, 64 * sizeof(struct nlmsghdr *));
 
-    signal(SIGUSR1, run_handler);
-    signal(SIGUSR2, wait_handler);
+    signal(SIGUSR1, wait_handler);
     signal(SIGHUP, reload_handler);
     signal(SIGTERM, stop_handler);
 
 reload:
     g_reload = 0;
+    g_wait = 0;
+    g_stop = 0;
+    g_run = 0;
+    switch_to = -1;
+    next = 0;
     read_config();
     if(read_interfaces(netlink_sck) < 0) {
         elogger("Error getting interfaces!");
@@ -697,7 +707,7 @@ reload:
     while(!g_stop) {
         sysinfo(&si);
         if(g_wait) {
-            if(si.uptime > wait_max) {
+            if(si.uptime >= wait_max) {
                 g_wait = 0;
                 logger("Wait app timeout. Kill app");
                 restart_main_app();
@@ -714,12 +724,12 @@ reload:
                 }
                 switch_to = -1;
             } else {
-                if(last == 0 || si.uptime > last + 10 || g_run) {
+                if(next == 0 || si.uptime >= next || g_run) {
                     read_routes(netlink_sck);
                     if(active_cnt > 1) {
                         check_interfaces();
                     }
-                    last = si.uptime;
+                    next = si.uptime + CHECK_INTERVAL_S;
                     if(g_run) {
                         g_run = 0;
                     }
